@@ -1,34 +1,44 @@
-# SAM 3 自动标注工具箱 (SAM 3 Auto-Labeling Toolkit)
+# SAM 自动标注工具箱 (SAM Auto-Labeling Toolkit)
 
-本项目利用 **SAM 3 (Segment Anything Model 3)** 实现高精度的图像自动化标注。特别针对需要后续透视变换（摆正）的靶标识别任务进行了优化。
+本项目集成 **SAM (Segment Anything Model)** 系列模型，提供多种自动标注方案。包含基于颜色特征的通用标注工具和基于文本提示的特定任务（五边形靶标）标注工具。
 
-## 🎯 核心特性：几何感知排序
+## 🛠️ 核心工具
 
-为了支持后续的数字识别和姿态校正，本工具生成的标注文件具有严格的**几何顺序**：
+### 1. 通用自动标注 (`auto_label.py`)
+利用 **SAM 3** 的强大文本提示能力，快速生成目标检测数据。
+- **工作流**：文本提示 (Text Prompt) -> SAM 3 分割 -> 外接矩形框 (Bounding Box)。
+- **应用场景**：适用于构建 YOLO 检测数据集，无需特定几何形状。
+- **输出格式**：标准 YOLO 检测格式 (`class_id x_center y_center width height`)。
 
-1.  **自动五边形拟合**：将分割 Mask 自动拟合为精确的 5 个顶点。
-2.  **固定顶点顺序**（完善中）：
-    *   **关键点 0 (Index 0)**：始终是五边形的**“顶点”**（算法默认取 Y 轴坐标最小的点，即视觉上的最高点）。
-    *   **后续点 (Index 1-4)**：严格按照**顺时针**方向排列。
+### 2. 特定任务标注 (`sam3_auto_label.py`)
+专门针对**五边形靶标**任务设计，利用 SAM 3 进行精细分割和关键点排序。
+- **几何感知排序**：自动将分割 Mask 拟合为 5 个有序顶点。
+  - **Index 0**：五边形顶点（最高点）。
+  - **Index 1-4**：顺时针排列。
+- **输出格式**：YOLO 关键点/分割格式 (`class_id x1 y1 x2 y2 x3 y3 x4 y4 x5 y5`)。
 
-这一特性使得下游的 YOLO 模型能够学习到顶点的概念，从而在推理阶段直接输出有序的关键点，方便直接进行 `cv2.getPerspectiveTransform`。
+### 3. 提示词测试实验 (`prompt_experiment.py`)
+在正式标注前，用于快速测试不同文本提示词（Prompt）的效果。
+- **功能**：对单张图片测试一组预设的 Prompt，统计每个 Prompt 能检出的 Mask 数量。
+- **用途**：帮助用户筛选出最适合当前数据集的 Prompt（例如 "red target" vs "pentagon"）。
 
 ## 📂 项目结构
 
 ```
 .
-├── sam3_auto_label.py       # 核心脚本：文本提示 -> 有序 YOLO 标签
-├── sam3.pt                  # 模型权重文件 (需放在此处)
+├── auto_label.py            # 通用脚本：文本提示 -> BBox 标注 (推荐)
+├── sam3_auto_label.py       # 特定脚本：文本提示 -> 有序五边形标签
+├── prompt_experiment.py     # 实验脚本：测试 Prompt 效果
+├── sam3.pt                  # SAM 3 模型权重
 ├── sam3/                    # SAM 3 源码库
-├── images/                  # 输入图片文件夹 (输出的 .txt 标签也会保存在这里)
-└── output_sam3_vis/         # 可视化结果 (用于检查标注质量)
+├── images/                  # 输入图片文件夹 (输出的 .txt 标签也在此)
+├── output_auto_label_vis/   # auto_label.py 的可视化结果
+└── output_sam3_vis/         # sam3_auto_label.py 的可视化结果
 ```
 
 ## 🚀 快速开始
 
 ### 1. 环境准备
-确保已安装 PyTorch, OpenCV, Pillow 等基础库，以及项目目录下的 `sam3` 依赖。
-
 ```bash
 pip install torch torchvision opencv-python pillow tqdm
 cd sam3
@@ -36,50 +46,33 @@ pip install -e .
 cd ..
 ```
 
-### 2. 准备数据
-将待标注的图片（.jpg/.png）放入 `images/` 文件夹。
-
-### 3. 运行自动标注
-运行脚本，它会自动下载模型（如果配置了 HF Token）或加载本地 `sam3.pt`。
-
+### 2. 挑选最佳 Prompt (可选)
+如果不确定用什么提示词，可以先运行实验：
 ```bash
-# 基本用法
-python sam3_auto_label.py
+python prompt_experiment.py
+```
+查看输出结果，选择能稳定检出目标的词。
 
-# 自定义参数
-python sam3_auto_label.py \
-  --image_dir my_dataset \
-  --prompt "pentagonal sign" \
-  --conf_thresh 0.5 \
-  --device cuda
+### 3. 运行通用标注 (BBox)
+```bash
+# 默认寻找 "target"
+python auto_label.py
+
+# 自定义 Prompt 和类别 ID
+python auto_label.py --prompt "red car" --class_id 2 --conf_thresh 0.3
+```
+- 结果保存在 `images/` (txt) 和 `output_auto_label_vis/` (可视化)。
+
+### 4. 运行特定任务标注 (五边形)
+针对需要识别“五边形”并排序的任务：
+```bash
+python sam3_auto_label.py --prompt "pentagonal sign" --conf_thresh 0.5
 ```
 
-### 4. 检查结果
-*   **标签文件**：在 `images/` 下生成的同名 `.txt` 文件。
-    *   格式：`0 <x1> <y1> <x2> <y2> <x3> <y3> <x4> <y4> <x5> <y5>`
-    *   其中 `(x1, y1)` 保证是顶点。
-*   **可视化**：查看 `output_sam3_vis/` 文件夹。
-    *   **红色大点**：顶点 (Index 0)。
-    *   **蓝色小点**：其余点，按顺时针带数字标记。
-
-## 📊 下游任务建议 (YOLO)
-
-使用此工具生成的数据训练 YOLO-Pose 或 YOLO-Segment 模型后，推理时的后处理流程建议：
-
-1.  **获取关键点**：模型输出的 Shape 为 `(5, 2)`。
-2.  **计算变换矩阵**：
-    ```python
-    # 假设 pred_kpts 是模型预测出的5个点
-    src_pts = pred_kpts.astype(np.float32)
-    
-    # 定义目标形状（例如正五边形或标准矩形，取决于你想怎么摆正）
-    # 这里以摆正为"正五边形"为例，或者只利用前三个点做仿射变换
-    # ...
-    
-    # 简单的摆正逻辑：利用 Index 0 (头) 和 Index 2,3 (底) 计算角度
-    top_point = src_pts[0]
-    # ...
-    ```
+## 📊 标注结果校验
+*   **auto_label.py**：检查 `output_auto_label_vis/` 下的绿色矩形框。
+*   **sam3_auto_label.py**：检查 `output_sam3_vis/` 下的红色大点是否在五边形顶部。
 
 ## ⚠️ 注意事项
-*   脚本假设大部分靶标在图像中是相对直立的（用于确定初始顶点）。如果您的数集包含大量倒置（180度旋转）的靶标，可能需要手动检查或修改 `order_points_pentagon` 中的逻辑。
+- `auto_label.py` 默认使用 CPU 推理（适合 Tiny 模型），如需加速可修改脚本中的 `DEVICE = "cuda"`。
+- `sam3_auto_label.py` 需要 `sam3.pt` 权重文件。

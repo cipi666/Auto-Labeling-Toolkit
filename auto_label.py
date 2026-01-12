@@ -3,159 +3,136 @@ import numpy as np
 import torch
 import os
 import glob
+import argparse
+from PIL import Image
+from tqdm import tqdm
 import sys
-os.environ['CUDA_VISIBLE_DEVICES']='2' 
-# === 路径配置 ===
-SAM2_REPO_PATH = "."  # 指向 sam2 源码目录
-MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml" 
-CHECKPOINT = "sam2.1_hiera_tiny.pt"
-IMAGE_DIR = "/home/pchen/ngyf2024/project/images"
-OUTPUT_DIR = "output_hybrid"
-DEVICE = "cpu"  # 您的环境暂时用CPU，Tiny模型很快
 
-# === 引入 SAM2 ===
-# 确保能导入 sam2
-if SAM2_REPO_PATH not in sys.path:
-    sys.path.append(SAM2_REPO_PATH)
+# === Configuration & Setup ===
+# Ensure sam3 is in path
+sys.path.insert(0, os.path.join(os.getcwd(), "sam3"))
 
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+try:
+    from sam3 import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
+except ImportError as e:
+    print("Error: Could not import SAM 3 modules. Make sure 'sam3' folder is in current directory.\n")
+    print(f"Details: {e}")
+    sys.exit(1)
 
-# ================= 1. OpenCV 粗定位 (只找点，不找轮廓) =================
-def get_prompts_from_color(image):
+def get_args():
+    parser = argparse.ArgumentParser(description="SAM 3 General Auto Labeling (YOLO BBox)")
+    parser.add_argument("--image_dir", type=str, default="images", help="Directory containing images")
+    parser.add_argument("--prompt", type=str, default="target", help="Text prompt for detection (e.g., 'car', 'person', 'red target')")
+    parser.add_argument("--class_id", type=int, default=0, help="Class ID for YOLO output")
+    parser.add_argument("--conf_thresh", type=float, default=0.4, help="Confidence threshold")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
+    parser.add_argument("--output_vis", action="store_true", default=True, help="Save visualization")
+    return parser.parse_args()
+
+def mask_to_bbox_yolo(mask, img_w, img_h):
     """
-    返回:
-    prompts: list of dict, [{'point': [x,y], 'label': class_id}, ...]
-    vis_img: 用于调试的中间图
+    Convert binary mask to YOLO bbox format: (x_center, y_center, w, h) normalized.
     """
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    prompts = []
-    
-    # --- 红色阈值 (HSV中红色在0和180两头) ---
-    lower_red1 = np.array([0, 80, 50])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 80, 50])
-    upper_red2 = np.array([180, 255, 255])
-    
-    mask_r1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask_r2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask_red = mask_r1 + mask_r2
-    
-    # --- 蓝色阈值 ---
-    lower_blue = np.array([100, 80, 50])
-    upper_blue = np.array([140, 255, 255])
-    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
-
-    # 查找红色中心点
-    contours_r, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours_r:
-        area = cv2.contourArea(cnt)
-        if area > 50: # 过滤太小的噪点
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                prompts.append({'point': [cx, cy], 'label': 0}) # 0: Red
-
-    # 查找蓝色中心点
-    contours_b, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours_b:
-        area = cv2.contourArea(cnt)
-        if area > 50:
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                prompts.append({'point': [cx, cy], 'label': 1}) # 1: Blue
-                
-    return prompts
-
-# ================= 2. 工具函数 =================
-def mask_to_yolo(mask, img_w, img_h):
     y, x = np.where(mask)
     if len(x) == 0: return None
     x_min, x_max = x.min(), x.max()
     y_min, y_max = y.min(), y.max()
-    w = x_max - x_min
-    h = y_max - y_min
-    cx = x_min + w / 2
-    cy = y_min + h / 2
-    return (cx/img_w, cy/img_h, w/img_w, h/img_h), (x_min, y_min, x_max, y_max)
+    
+    # Box dimensions
+    w_pixel = x_max - x_min
+    h_pixel = y_max - y_min
+    
+    # Center
+    cx_pixel = x_min + w_pixel / 2
+    cy_pixel = y_min + h_pixel / 2
+    
+    # Normalize
+    return (cx_pixel / img_w, cy_pixel / img_h, w_pixel / img_w, h_pixel / img_h), (x_min, y_min, x_max, y_max)
 
 def main():
-    # Load Model
-    cfg_path = os.path.join(SAM2_REPO_PATH, "sam2_configs", MODEL_CFG)
-    ckpt_path = os.path.join(SAM2_REPO_PATH, CHECKPOINT)
+    args = get_args()
     
-    print("正在加载 SAM 2 Predictor...")
-    sam2_model = build_sam2(MODEL_CFG, ckpt_path, device=DEVICE)
-    predictor = SAM2ImagePredictor(sam2_model)
+    if not os.path.exists(args.image_dir):
+        print(f"Error: Image directory '{args.image_dir}' does not exist.")
+        return
 
-    if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
+    vis_dir = "output_auto_label_vis"
+    if args.output_vis:
+        os.makedirs(vis_dir, exist_ok=True)
+
+    print(f"Loading SAM 3 Model (Device: {args.device})...")
+    # Path handling for BPE
+    bpe_path = os.path.join("sam3", "sam3", "assets", "bpe_simple_vocab_16e6.txt.gz")
+    if not os.path.exists(bpe_path):
+        bpe_path = os.path.join("sam3", "assets", "bpe_simple_vocab_16e6.txt.gz")
+
+    try:
+        model = build_sam3_image_model(
+            device=args.device,
+            checkpoint_path="sam3.pt",
+            bpe_path=bpe_path
+        )
+        processor = Sam3Processor(model, device=args.device, confidence_threshold=args.conf_thresh)
+    except Exception as e:
+        print(f"Model loading failed: {e}")
+        return
+
+    image_paths = glob.glob(os.path.join(args.image_dir, "*.jpg")) + \
+                  glob.glob(os.path.join(args.image_dir, "*.png"))
     
-    img_files = glob.glob(os.path.join(IMAGE_DIR, "*.jpg")) + glob.glob(os.path.join(IMAGE_DIR, "*.png"))
+    print(f"Found {len(image_paths)} images. Processing with prompt: '{args.prompt}'")
     
-    for img_path in img_files:
-        print(f"处理: {os.path.basename(img_path)}")
-        image = cv2.imread(img_path)
-        if image is None: continue
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        h, w = image.shape[:2]
-        
-        # --- Step 1: OpenCV 找提示点 ---
-        prompts = get_prompts_from_color(image)
-        if not prompts:
-            print("  -> 未发现红/蓝目标点")
-            continue
+    for img_path in tqdm(image_paths):
+        try:
+            image_pil = Image.open(img_path).convert("RGB")
+            w, h = image_pil.size
             
-        # --- Step 2: 设置 SAM 图像 ---
-        predictor.set_image(image_rgb)
-        
-        txt_lines = []
-        vis_img = image.copy()
-        
-        # --- Step 3: 对每个点进行 Prompt 推理 ---
-        for p in prompts:
-            point_coords = np.array([p['point']]) # Shape: [1, 2]
-            point_labels = np.array([1])          # 1 表示这是一个前景点
-            class_id = p['label']
+            # Inference
+            inference_state = processor.set_image(image_pil)
+            inference_state = processor.set_text_prompt(args.prompt, inference_state)
             
-            # 让 SAM 预测 Mask
-            masks, scores, _ = predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                multimask_output=True # 输出3个mask，我们要选分数最高的
-            )
+            masks = inference_state["masks"]
+            scores = inference_state["scores"]
             
-            # 取分数最高的 Mask
-            best_idx = np.argmax(scores)
-            best_mask = masks[best_idx]
+            yolo_lines = []
+            vis_img = np.array(image_pil)
+            vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
             
-            # --- Step 4: 转 YOLO ---
-            res = mask_to_yolo(best_mask, w, h)
-            if res:
-                (ycx, ycy, yw, yh), (x1, y1, x2, y2) = res
-                txt_lines.append(f"{class_id} {ycx:.6f} {ycy:.6f} {yw:.6f} {yh:.6f}")
+            if masks is not None and len(masks) > 0:
+                for i, mask_tensor in enumerate(masks):
+                    score = scores[i].item()
+                    if score < args.conf_thresh:
+                        continue
+                    
+                    mask_np = mask_tensor.squeeze().cpu().numpy()
+                    
+                    res = mask_to_bbox_yolo(mask_np, w, h)
+                    if res:
+                        (ncx, ncy, nw, nh), (x1, y1, x2, y2) = res
+                        
+                        # YOLO Format: class_id x_center y_center width height
+                        yolo_lines.append(f"{args.class_id} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}")
+                        
+                        if args.output_vis:
+                            cv2.rectangle(vis_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            cv2.putText(vis_img, f"{score:.2f}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # Save Label
+            txt_path = os.path.splitext(img_path)[0] + ".txt"
+            with open(txt_path, "w") as f:
+                f.write("\n".join(yolo_lines))
+            
+            # Save Vis
+            if args.output_vis and yolo_lines:
+                vis_out_path = os.path.join(vis_dir, os.path.basename(img_path))
+                cv2.imwrite(vis_out_path, vis_img)
                 
-                # 画图可视化
-                color = (0, 0, 255) if class_id == 0 else (255, 0, 0)
-                # 画框
-                cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
-                # 画提示点 (证明是用这个点生成的)
-                cv2.circle(vis_img, tuple(p['point']), 5, (0, 255, 255), -1)
-                # 画半透明 Mask
-                vis_img[best_mask > 0] = vis_img[best_mask > 0] * 0.5 + np.array(color) * 0.5
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+            continue
 
-        # 保存结果
-        base_name = os.path.splitext(os.path.basename(img_path))[0]
-        
-        # 保存 TXT
-        with open(os.path.join(IMAGE_DIR, base_name + ".txt"), 'w') as f:
-            f.write("\n".join(txt_lines))
-            
-        # 保存可视化图
-        cv2.imwrite(os.path.join(OUTPUT_DIR, base_name + "_vis.jpg"), vis_img)
-        print(f"  -> 保存 {len(txt_lines)} 个目标")
+    print("Done!")
 
 if __name__ == "__main__":
     main()
